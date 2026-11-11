@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Crash-safe fake refund workflows with reconciliation.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    CodeUri: src/
+    Timeout: 30
+    MemorySize: 256
+    Tracing: Active
+    Environment:
+      Variables:
+        WORKFLOWS_TABLE: !Ref WorkflowsTable
+        EVENTS_TABLE: !Ref WorkflowEventsTable
+        REFUNDS_TABLE: !Ref FakeRefundsTable
+
+Resources:
+  Api:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+
+  WorkflowsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: workflow_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: workflow_id
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  WorkflowEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: workflow_id
+          AttributeType: S
+        - AttributeName: event_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: workflow_id
+          KeyType: HASH
+        - AttributeName: event_id
+          KeyType: RANGE
+
+  FakeRefundsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: idempotency_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: idempotency_key
+          KeyType: HASH
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: alias/aws/sqs
+      MessageRetentionPeriod: 1209600
+
+  WorkflowQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: alias/aws/sqs
+      VisibilityTimeout: 180
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  CreateWorkflowFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: workflows.create.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WorkflowsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WorkflowEventsTable
+      Events:
+        CreateWorkflow:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /workflows
+            Method: POST
+
+  GetWorkflowFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: workflows.get.lambda_handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref WorkflowsTable
+      Events:
+        GetWorkflow:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /workflows/{workflow_id}
+            Method: GET
+
+  GetWorkflowEventsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: workflows.events.lambda_handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref WorkflowEventsTable
+      Events:
+        GetWorkflowEvents:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /workflows/{workflow_id}/events
+            Method: GET
+
+  EnqueueWorkflowFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: worker.enqueue.lambda_handler
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref WorkflowQueue
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt WorkflowQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:DescribeStream
+                - dynamodb:GetRecords
+                - dynamodb:GetShardIterator
+                - dynamodb:ListStreams
+              Resource: !Sub ${WorkflowsTable.Arn}/stream/*
+      Events:
+        WorkflowStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt WorkflowsTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 10
+            BisectBatchOnFunctionError: true
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  MockPayFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: mockpay.handler.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FakeRefundsTable
+      Events:
+        CreateRefund:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /mockpay/refunds
+            Method: POST
+        GetRefund:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /mockpay/refunds/{idempotency_key}
+            Method: GET
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: worker.handler.lambda_handler
+      Environment:
+        Variables:
+          MOCKPAY_FUNCTION: !Ref MockPayFunction
+          MAX_RECEIVE_COUNT: 3
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WorkflowsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WorkflowEventsTable
+        - LambdaInvokePolicy:
+            FunctionName: !Ref MockPayFunction
+        - SQSPollerPolicy:
+            QueueName: !GetAtt WorkflowQueue.QueueName
+      Events:
+        WorkQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt WorkflowQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  DeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: AgentLedger has permanently failed workflow messages.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.${AWS::URLSuffix}
+  DeadLetterQueueUrl:
+    Value: !Ref DeadLetterQueue
+
